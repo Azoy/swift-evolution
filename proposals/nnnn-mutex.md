@@ -18,10 +18,9 @@ A simple solution to this problem is to protect this mutable state with a lock. 
 * [`_ManagedCriticalState` in the Observation module](https://github.com/apple/swift/blob/main/stdlib/public/Observation/Sources/Observation/Locking.swift)
 * [`LockedState` in swift-foundation](https://github.com/apple/swift-foundation/blob/main/Sources/_FoundationInternals/LockedState.swift)
 * [`NIOLock` in Swift NIO](https://github.com/apple/swift-nio/blob/main/Sources/NIOConcurrencyHelpers/NIOLock.swift)
+* [`OSAllocatedUnfairLock`](https://developer.apple.com/documentation/os/osallocatedunfairlock)
 
-Of course the main issue is that there isn't a single standardized implementation for this kind of type resulting in everyone essentially needing to roll their own. On Apple platforms, the SDK includes [`OSAllocatedUnfairLock`](https://developer.apple.com/documentation/os/osallocatedunfairlock) which aims to standardize the lock implementation. Unfortunately it does not apply to open-source libraries that need to interoperate on platforms where this type doesn't exist.
-
-Rolling your own lock implementation isn't an easy endeavor. Many implementations either 1. use `UnsafeMutablePointer.allocate` or 2. go through `ManagedBuffer` both to get access to a stable address but to also ensure there won't be any intermediate copies or exclusivity checks. Both of those solutions are super inefficient because of the allocation which is completely unnecessary, but unfortunately it was the only solution Swift had to offer in this space. This is the core reason why the standard library has never proposed a proper mutex type because we always knew it would not be the solution we wanted.
+Of course the main issue is that there isn't a single standardized implementation for this kind of type resulting in everyone essentially needing to roll their own. Rolling your own lock implementation isn't an easy endeavor. Many implementations either 1. use `UnsafeMutablePointer.allocate` or 2. go through `ManagedBuffer` both to get access to a stable address but to also ensure there won't be any intermediate copies or exclusivity checks. Both of those solutions are super inefficient because of the allocation which is completely unnecessary, but unfortunately it was the only solution Swift had to offer in this space. This is the core reason why the standard library has never proposed a proper mutex type because we always knew it would not be the solution we wanted.
 
 Until now the only workable solution to implement locking in Swift has involved explicit heap allocations, either manual or managed. We can do better.
 
@@ -372,7 +371,7 @@ Source compatibility is preserved with the proposed API design as it is all addi
 
 The API proposed here is fully addative and does not change or alter any of the existing ABI.
 
-`Mutex` as proposed will be a new `@frozen` struct which means we cannot change its layout in the future on ABI stable platforms, namely the Darwin family. Because we cannot change the layout, we will most likely not be able to change to a hypothetical new and improved system mutex implementation on those platforms. If said new system mutex were to share the layout of the currently proposed underlying implementation, then we _may_ be able to migrate over to that implementation. Keep in mind that Linux and Windows are non-ABI stable platforms, so we can freely the underlying implementation if the platform ever supports something better.
+`Mutex` as proposed will be a new `@frozen` struct which means we cannot change its layout in the future on ABI stable platforms, namely the Darwin family. Because we cannot change the layout, we will most likely not be able to change to a hypothetical new and improved system mutex implementation on those platforms. If said new system mutex were to share the layout of the currently proposed underlying implementation, then we _may_ be able to migrate over to that implementation. Keep in mind that Linux and Windows are non-ABI stable platforms, so we can freely change the underlying implementation if the platform ever supports something better.
 
 ## Future directions
 
@@ -383,9 +382,9 @@ There are quite a few potential future directions this new type can take as well
 With [Region Based Isolation](https://github.com/apple/swift-evolution/blob/main/proposals/0414-region-based-isolation.md), a future direction in that proposal is the introduction of a `transferring` modifier to function parameters. This would allow the `Mutex` type to decorate its closure parameter in the `withLock` API as `transferring` and potentially remove the `@Sendable` restriction on the closure altogether. By marking the closure parameter as such, we guarantee that state held within the lock cannot be assigned to some non-sendable captured reference which is the primary motivator for why the closure is marked `@Sendable` now to begin with. A future closure based API may look something like the following:
 
 ```swift
-public borrowing func withLock<U: ~Copyable & Sendable>(
-  _: (transferring inout Value) throws -> U
-) rethrows -> U
+public borrowing func withLock<U: ~Copyable & Sendable, E>(
+  _: (transferring inout Value) throws(E) -> U
+) throws(E) -> U
 ```
 
 This would remove a lot of the restrictions that a `@Sendable` closure enforces because this closure isn't escaping nor is it being passed to other isolation domains, it's being ran on the same calling execution context. However, again we guarantee that the passed in parameter, who may not be sendable, can't be written to a non-sendable reference within the closure effectively crossing isolation domains.
