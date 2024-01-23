@@ -346,8 +346,8 @@ If the `withLock` method was not labeled with `@Sendable` then this code would e
 func something() {
   lockedPointer.withLock {
     // warning: non-sendable type 'NonSendableReference' in asynchronous access
-    // 					to main actor-isolated let 'nonSendableRef' cannot cross actor
-    //					boundary
+    //          to main actor-isolated let 'nonSendableRef' cannot cross actor
+    //          boundary
     nonSendableRef.prop = $0
   }
   
@@ -356,7 +356,7 @@ func something() {
   
   lockedPointer.withLock {
     // warning: capture of 'nonSendableRefCopy' with non-sendable type
-    // 					'NonSendableReference' in a '@Sendable' closure
+    //          'NonSendableReference' in a '@Sendable' closure
     nonSendableRefCopy.prop = $0
   }
 }
