@@ -7,21 +7,21 @@
 
 ## Introduction
 
-This proposal introduces a mutual exclusion lock, or a mutex, in the standard library as a new synchronization primitive in the synchronization module.
+This proposal introduces a mutual exclusion lock, or a mutex, to the standard library. `Mutex` will be a new synchronization primitive in the synchronization module.
 
 ## Motivation
 
-Since the dawn of Swift, one of the most difficult issues to resolve was synchronizing access for core standard library collections like `Array`, `Dictionary` and `Set`. These types are not concurrent and do not provide any sort of concurrency guarantees for things like thread safety. However, it is still very common to accidentally write a class with a dictionary stored property and perform no synchronization to ensure access to this property is well defined across multiple threads.
+Since the dawn of Swift, one of the most difficult issues to resolve has been synchronizing access for core standard library collections such as `Array`, `Dictionary` and `Set`. These types do not provide any sort of  thread safety, and are prone to data races. For example, it is a common pitfall to implement a class that contains a property of type `Dictionary` without proper synchronization ensuring that access to this property is well defined across multiple threads.
 
-One of the simplest solutions to this problem is to protect this mutable state with a lock. Most commonly, said lock would be implemented via a mutex and ensures that a single execution context has read/write access to the value the lock is protecting. In fact, locks make it extremely easy to protect any sort of state value. There are hundreds, maybe thousands, of the same lock implementation (slight variations of course) in almost every code base I look through. These are just a few implementations in related Swift projects:
+A simple solution to this problem is to protect this mutable state with a lock. Commonly, the protection would be implemented as a mutex, and ensures that only one execution context at a time has read/write access to the value the lock is protecting. Locks make it easy to protect any sort of value used as shared state. There are hundreds of similar lock implementations in Swift code bases. The following are a few implementations in projects related to Swift:
 
-* [Observation module in Standard Library](https://github.com/apple/swift/blob/main/stdlib/public/Observation/Sources/Observation/Locking.swift)
-* [Open source Foundation repository](https://github.com/apple/swift-foundation/blob/main/Sources/_FoundationInternals/LockedState.swift)
-* [Swift NIO's NIOLock](https://github.com/apple/swift-nio/blob/main/Sources/NIOConcurrencyHelpers/NIOLock.swift)
+* [`_ManagedCriticalState` in the Observation module](https://github.com/apple/swift/blob/main/stdlib/public/Observation/Sources/Observation/Locking.swift)
+* [`LockedState` in swift-foundation](https://github.com/apple/swift-foundation/blob/main/Sources/_FoundationInternals/LockedState.swift)
+* [`NIOLock` in Swift NIO](https://github.com/apple/swift-nio/blob/main/Sources/NIOConcurrencyHelpers/NIOLock.swift)
 
-Of course the main issue is that there isn't a single standardized implementation for this kind of type resulting in everyone essentially needing to roll their own. On Apple platforms with the Apple SDK there is [`OSAllocatedUnfairLock`](https://developer.apple.com/documentation/os/osallocatedunfairlock) which aims to bring some of this standardization to Apple platforms, but of course these open source libraries need to interoperate on platforms where this type doesn't exist.
+Of course the main issue is that there isn't a single standardized implementation for this kind of type resulting in everyone essentially needing to roll their own. On Apple platforms, the SDK includes [`OSAllocatedUnfairLock`](https://developer.apple.com/documentation/os/osallocatedunfairlock) which aims to standardize the lock implementation. Unfortunately it does not apply to open-source libraries need to interoperate on platforms where this type doesn't exist.
 
-Rolling your own lock implementation isn't an easy endeavor either if you didn't already know about Swift's memory model for structs and classes. Consider the following naive implementation of an `os_unfair_lock` implementation in Swift:
+Rolling your own lock implementation isn't an easy endeavor. ~~either if you didn't already know about Swift's memory model for structs and classes. Consider the following naive implementation of an `os_unfair_lock` implementation in Swift:~~
 
 ```swift
 struct OSUnfairLock {
@@ -33,13 +33,17 @@ struct OSUnfairLock {
 }
 ```
 
-This is \_extremely\_ incorrect. Swift does not guarantee a stable address at all for the storage property and the compiler is free to emit as many copies of this thing as it wants on any and all uses. `&storage` also invokes the "inout" operator which will emit dynamic exclusivity checks surrounding the access. Ok, just change `struct` to `class` and we have stable addresses to properties right? Well, yes, but actually no. Swift guarantees that ivars have stable addresses, but accessing their pointer with `&` shares all of the same problems we just discussed with structs. The compiler is free to emit a copy of the property and give you a pointer to that copy, emit exclusivity checks, etc. It's still not the right solution.
+~~This is \_extremely\_ incorrect. Swift does not guarantee a stable address at all for the storage property and the compiler is free to emit as many copies of this thing as it wants on any and all uses. `&storage` also invokes the "inout" operator which will emit dynamic exclusivity checks surrounding the access. Ok, just change `struct` to `class` and we have stable addresses to properties right? Well, yes, but actually no. Swift guarantees that ivars have stable addresses, but accessing their pointer with `&` shares all of the same problems we just discussed with structs. The compiler is free to emit a copy of the property and give you a pointer to that copy, emit exclusivity checks, etc. It's still not the right solution.~~
 
-What you'll see a lot of implementations do is either 1. use `UnsafeMutablePointer.allocate` or 2. go through `ManagedBuffer` to get access to a stable address but also ensure there won't be any intermediate copies or exclusivity checks. Both of those solutions are super inefficient because of the allocation which is completely unnecessary, but unfortunately it was the only solution Swift had to offer in this space. This is the core reason why the standard library has never proposed a proper mutex type because we always knew it would not be the solution we wanted.
+[NOTE: we don't need to belabor the point. We _can_ include the paragraph after, which explains that prudent implementations are not that good even when correct…]
+
+~~Many implementations do is either 1. use `UnsafeMutablePointer.allocate` or 2. go through `ManagedBuffer` to get access to a stable address but also ensure there won't be any intermediate copies or exclusivity checks. Both of those solutions are super inefficient because of the allocation which is completely unnecessary, but unfortunately it was the only solution Swift had to offer in this space. This is the core reason why the standard library has never proposed a proper mutex type because we always knew it would not be the solution we wanted.~~
+
+Until now the only workable solution to implement locking in Swift has involved explicit heap allocations, either manual or managed. We can do better.
 
 ## Proposed solution
 
-We \_finally\_ propose a new type in the Standard Library Synchronization module called `Mutex`. This type will be a wrapper over a platform implemented mutex primitive carrying along some user defined state to protect. Below is an example use of `Mutex` protecting some internal data in a class who is to be used across many threads:
+We \_finally\_ propose a new type in the Standard Library Synchronization module: `Mutex`. This type will be a wrapper over a platform-specific mutex primitive, along with the user-defined state to protect. Below is an example use of `Mutex` protecting some internal data in a class usable simultaneously by many threads:
 
 ```swift
 class FancyManagerOfSorts {
@@ -53,7 +57,7 @@ class FancyManagerOfSorts {
 }
 ```
 
-This is a very common use case for such a type to provide quick and relatively easy synchronization for this internal shared mutable state. Another very common example is a global cache, usually either an array or dictionary:
+Use cases for such a synchronized type are common. Another common need is a global cache, such as a dictionary:
 
 ```swift
 let globalCache = Mutex<[MyKey: MyValue]>([:])
@@ -63,16 +67,16 @@ let globalCache = Mutex<[MyKey: MyValue]>([:])
 
 ### Underlying System Mutex Implementation
 
-The `Mutex` type proposed is not a new mutex implementation whatsoever, we are calling into a platform's implementation. 
+The `Mutex` type proposed is a wrapper around a platform's implementation. 
 
-* macOS, iOS, watchOS, tvOS:
+* macOS, iOS, watchOS, tvOS, visionOS:
   * `os_unfair_lock`
 * Linux:
   * `pthread_mutex_t`
 * Windows:
   * `SRWLOCK`
 
-These mutex implementations all have different capabilities and guarantee different levels of fairness, but for our `Mutex` type we do not guarantee fairness whatsoever meaning it's okay to have different behavior from platform to platform. We only guarantee that a single execution context will have access to the critical section via mutual exclusion.
+These mutex implementations all have different capabilities and guarantee different levels of fairness. Our proposed `Mutex` type does not guarantee fairness, and therefore it's okay to have different behavior from platform to platform. We only guarantee that only one execution context at a time will have access to the critical section, via mutual exclusion.
 
 ### API Design
 
