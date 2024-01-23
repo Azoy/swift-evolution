@@ -7,39 +7,27 @@
 
 ## Introduction
 
-This proposal introduces a mutual exclusion lock, or a mutex, in the standard library as a new synchronization primitive in the synchronization module.
+This proposal introduces a mutual exclusion lock, or a mutex, to the standard library. `Mutex` will be a new synchronization primitive in the synchronization module.
 
 ## Motivation
 
-Since the dawn of Swift, one of the most difficult issues to resolve was synchronizing access for core standard library collections like `Array`, `Dictionary` and `Set`. These types are not concurrent and do not provide any sort of concurrency guarantees for things like thread safety. However, it is still very common to accidentally write a class with a dictionary stored property and perform no synchronization to ensure access to this property is well defined across multiple threads.
+Since the dawn of Swift, one of the most difficult issues to resolve has been synchronizing access for core standard library collections such as `Array`, `Dictionary` and `Set`. These types are not concurrent and do not provide any sort of thread safety, and are prone to data races. For example, it is a common pitfall to implement a class that contains a property of type `Dictionary` without proper synchronization ensuring that access to this property is well defined across multiple threads.
 
-One of the simplest solutions to this problem is to protect this mutable state with a lock. Most commonly, said lock would be implemented via a mutex and ensures that a single execution context has read/write access to the value the lock is protecting. In fact, locks make it extremely easy to protect any sort of state value. There are hundreds, maybe thousands, of the same lock implementation (slight variations of course) in almost every code base I look through. These are just a few implementations in related Swift projects:
+A simple solution to this problem is to protect this mutable state with a lock. Commonly, the protection would be implemented as a mutex, and ensures that only one execution context at a time has read/write access to the value the lock is protecting. Locks make it easy to protect any sort of value used as shared state. There are hundreds of similar lock implementations in Swift code bases. The following are a few implementations in projects related to Swift:
 
-* [Observation module in Standard Library](https://github.com/apple/swift/blob/main/stdlib/public/Observation/Sources/Observation/Locking.swift)
-* [Open source Foundation repository](https://github.com/apple/swift-foundation/blob/main/Sources/_FoundationInternals/LockedState.swift)
-* [Swift NIO's NIOLock](https://github.com/apple/swift-nio/blob/main/Sources/NIOConcurrencyHelpers/NIOLock.swift)
+* [`_ManagedCriticalState` in the Observation module](https://github.com/apple/swift/blob/main/stdlib/public/Observation/Sources/Observation/Locking.swift)
+* [`LockedState` in swift-foundation](https://github.com/apple/swift-foundation/blob/main/Sources/_FoundationInternals/LockedState.swift)
+* [`NIOLock` in Swift NIO](https://github.com/apple/swift-nio/blob/main/Sources/NIOConcurrencyHelpers/NIOLock.swift)
 
-Of course the main issue is that there isn't a single standardized implementation for this kind of type resulting in everyone essentially needing to roll their own. On Apple platforms with the Apple SDK there is [`OSAllocatedUnfairLock`](https://developer.apple.com/documentation/os/osallocatedunfairlock) which aims to bring some of this standardization to Apple platforms, but of course these open source libraries need to interoperate on platforms where this type doesn't exist.
+Of course the main issue is that there isn't a single standardized implementation for this kind of type resulting in everyone essentially needing to roll their own. On Apple platforms, the SDK includes [`OSAllocatedUnfairLock`](https://developer.apple.com/documentation/os/osallocatedunfairlock) which aims to standardize the lock implementation. Unfortunately it does not apply to open-source libraries that need to interoperate on platforms where this type doesn't exist.
 
-Rolling your own lock implementation isn't an easy endeavor either if you didn't already know about Swift's memory model for structs and classes. Consider the following naive implementation of an `os_unfair_lock` implementation in Swift:
+Rolling your own lock implementation isn't an easy endeavor. Many implementations either 1. use `UnsafeMutablePointer.allocate` or 2. go through `ManagedBuffer` both to get access to a stable address but to also ensure there won't be any intermediate copies or exclusivity checks. Both of those solutions are super inefficient because of the allocation which is completely unnecessary, but unfortunately it was the only solution Swift had to offer in this space. This is the core reason why the standard library has never proposed a proper mutex type because we always knew it would not be the solution we wanted.
 
-```swift
-struct OSUnfairLock {
-  var storage: os_unfair_lock_s
-  
-  mutating func lock() {
-    os_unfair_lock_lock(&storage)
-  }
-}
-```
-
-This is \_extremely\_ incorrect. Swift does not guarantee a stable address at all for the storage property and the compiler is free to emit as many copies of this thing as it wants on any and all uses. `&storage` also invokes the "inout" operator which will emit dynamic exclusivity checks surrounding the access. Ok, just change `struct` to `class` and we have stable addresses to properties right? Well, yes, but actually no. Swift guarantees that ivars have stable addresses, but accessing their pointer with `&` shares all of the same problems we just discussed with structs. The compiler is free to emit a copy of the property and give you a pointer to that copy, emit exclusivity checks, etc. It's still not the right solution.
-
-What you'll see a lot of implementations do is either 1. use `UnsafeMutablePointer.allocate` or 2. go through `ManagedBuffer` to get access to a stable address but also ensure there won't be any intermediate copies or exclusivity checks. Both of those solutions are super inefficient because of the allocation which is completely unnecessary, but unfortunately it was the only solution Swift had to offer in this space. This is the core reason why the standard library has never proposed a proper mutex type because we always knew it would not be the solution we wanted.
+Until now the only workable solution to implement locking in Swift has involved explicit heap allocations, either manual or managed. We can do better.
 
 ## Proposed solution
 
-We \_finally\_ propose a new type in the Standard Library Synchronization module called `Mutex`. This type will be a wrapper over a platform implemented mutex primitive carrying along some user defined state to protect. Below is an example use of `Mutex` protecting some internal data in a class who is to be used across many threads:
+We \_finally\_ propose a new type in the Standard Library Synchronization module: `Mutex`. This type will be a wrapper over a platform-specific mutex primitive, along with a user-defined state to protect. Below is an example use of `Mutex` protecting some internal data in a class usable simultaneously by many threads:
 
 ```swift
 class FancyManagerOfSorts {
@@ -53,7 +41,7 @@ class FancyManagerOfSorts {
 }
 ```
 
-This is a very common use case for such a type to provide quick and relatively easy synchronization for this internal shared mutable state. Another very common example is a global cache, usually either an array or dictionary:
+Use cases for such a synchronized type are common. Another common need is a global cache, such as a dictionary:
 
 ```swift
 let globalCache = Mutex<[MyKey: MyValue]>([:])
@@ -63,54 +51,217 @@ let globalCache = Mutex<[MyKey: MyValue]>([:])
 
 ### Underlying System Mutex Implementation
 
-The `Mutex` type proposed is not a new mutex implementation whatsoever, we are calling into a platform's implementation. 
+The `Mutex` type proposed is a wrapper around a platform's implementation.
 
-* macOS, iOS, watchOS, tvOS:
+* macOS, iOS, watchOS, tvOS, visionOS:
   * `os_unfair_lock`
 * Linux:
   * `pthread_mutex_t`
 * Windows:
   * `SRWLOCK`
 
-These mutex implementations all have different capabilities and guarantee different levels of fairness, but for our `Mutex` type we do not guarantee fairness whatsoever meaning it's okay to have different behavior from platform to platform. We only guarantee that a single execution context will have access to the critical section via mutual exclusion.
+These mutex implementations all have different capabilities and guarantee different levels of fairness. Our proposed `Mutex` type does not guarantee fairness, and therefore it's okay to have different behavior from platform to platform. We only guarantee that only one execution context at a time will have access to the critical section, via mutual exclusion.
 
 ### API Design
 
 Below is the complete API design for the new `Mutex` type:
 
 ```swift
-// TODO: Documentation
+/// A synchronization primitive that protects shared mutable state via
+/// mutual exclusion.
+///
+/// The `Mutex` type offers non-recursive exclusive access to the state
+/// it is protecting by blocking threads attempting to acquire the lock.
+/// Only one execution context at a time has access to the value stored
+/// within the `Mutex` allowing for exclusive access.
+///
+/// An example use of `Mutex` in a class used simultaneously by many
+/// threads protecting a `Dictionary` value:
+///
+///     class Manager {
+///       let cache = Mutex<[Key: Resource]>([:])
+///
+///       func saveResouce(_ resource: Resouce, as key: Key) {
+///         cache.withLock {
+///           $0[key] = resource
+///         }
+///       }
+///     }
+///
 public struct Mutex<Value: ~Copyable>: ~Copyable {
-  // TODO: Documentation
+  /// Initializes a value of this mutex with the given initial state.
+  ///
+  /// - Parameter initialValue: The initial value to give to the mutex.
   public init(_: consuming Value)
   
-  // TODO: Documentation
+  /// Attempts to acquire the lock and then calls the given closure if
+  /// successful.
+  ///
+  /// If the calling thread was successful in acquiring the lock, the
+  /// closure will be executed and then immediately after it will
+  /// release ownership of the lock. If we were unable to acquire the
+  /// lock, this will return `nil`.
+  ///
+  /// This method is equivalent to the following sequence of code:
+  ///
+  ///     guard mutex.tryLock() else {
+  ///       return nil
+  ///     }
+  ///     defer {
+  ///       mutex.unlock()
+  ///     }
+  ///     return try body(&value)
+  ///
+  /// - Warning: Recursive calls to `tryWithLock` within the
+  ///   closure parameter has behavior that is platform dependent.
+  ///   Some platforms may choose to panic the process, deadlock,
+  ///   or leave this behavior unspecified.
+  ///
+  /// - Parameter body: A closure with a parameter of `Value`
+  ///   that has exclusive access to the value being stored within
+  ///   this mutex. This closure is considered the critical section
+  ///   as it will only be executed if the calling thread acquires
+  ///   the lock.
+  ///
+  /// - Returns: The return value, if any, of the `body` closure parameter
+  ///   or nil if the lock couldn't be acquired.
   public borrowing func tryWithLock<U: ~Copyable & Sendable, E>(
-  	_: @Sendable (inout Value) throws(E) -> U
+    _ body: @Sendable (inout Value) throws(E) -> U
   ) throws(E) -> U?
   
-  // TODO: Documentation
+  /// Attempts to acquire the lock and then calls the given closure if
+  /// successful.
+  ///
+  /// If the calling thread was successful in acquiring the lock, the
+  /// closure will be executed and then immediately after it will
+  /// release ownership of the lock. If we were unable to acquire the
+  /// lock, this will return `nil`.
+  ///
+  /// This method is equivalent to the following sequence of code:
+  ///
+  ///     guard mutex.tryLock() else {
+  ///       return nil
+  ///     }
+  ///     defer {
+  ///       mutex.unlock()
+  ///     }
+  ///     return try body(&value)
+  ///
+  /// - Note: This version of `withLock` is unchecked because it does
+  ///   not enforce any sendability guarantees.
+  ///
+  /// - Warning: Recursive calls to `tryWithLockUnchecked` within the
+  ///   closure parameter has behavior that is platform dependent.
+  ///   Some platforms may choose to panic the process, deadlock,
+  ///   or leave this behavior unspecified.
+  ///
+  /// - Parameter body: A closure with a parameter of `Value`
+  ///   that has exclusive access to the value being stored within
+  ///   this mutex. This closure is considered the critical section
+  ///   as it will only be executed if the calling thread acquires
+  ///   the lock.
+  ///
+  /// - Returns: The return value, if any, of the `body` closure parameter
+  ///   or nil if the lock couldn't be acquired.
   public borrowing func tryWithLockUnchecked<U: ~Copyable, E>(
-  	_: @Sendable (inout Value) throws(E) -> U
+    _ body: @Sendable (inout Value) throws(E) -> U
   ) throws(E) -> U?
   
-  // TODO: Documentation
+  /// Calls the given closure after acquring the lock and then releases
+  /// ownership.
+  ///
+  /// This method is equivalent to the following sequence of code:
+  ///
+  ///     mutex.lock()
+  ///     defer {
+  ///       mutex.unlock()
+  ///     }
+  ///     return try body(&value)
+  ///
+  /// - Warning: Recursive calls to `withLock` within the
+  ///   closure parameter has behavior that is platform dependent.
+  ///   Some platforms may choose to panic the process, deadlock,
+  ///   or leave this behavior unspecified.
+  ///
+  /// - Parameter body: A closure with a parameter of `Value`
+  ///   that has exclusive access to the value being stored within
+  ///   this mutex. This closure is considered the critical section
+  ///   as it will only be executed once the calling thread has
+  ///   acquired the lock.
+  ///
+  /// - Returns: The return value, if any, of the `body` closure parameter.
   public borrowing func withLock<U: ~Copyable & Sendable, E>(
-    _: @Sendable (inout Value) throws(E) -> U
+    _ body: @Sendable (inout Value) throws(E) -> U
   ) throws(E) -> U
   
-  // TODO: Documentation
+  /// Calls the given closure after acquring the lock and then releases
+  /// ownership.
+  ///
+  /// This method is equivalent to the following sequence of code:
+  ///
+  ///     mutex.lock()
+  ///     defer {
+  ///       mutex.unlock()
+  ///     }
+  ///     return try body(&value)
+  ///
+  /// - Warning: Recursive calls to `withLockUnchecked` within the
+  ///   closure parameter has behavior that is platform dependent.
+  ///   Some platforms may choose to panic the process, deadlock,
+  ///   or leave this behavior unspecified.
+  ///
+  /// - Note: This version of `withLock` is unchecked because it does
+  ///   not enforce any sendability guarantees.
+  ///
+  /// - Parameter body: A closure with a parameter of `Value`
+  ///   that has exclusive access to the value being stored within
+  ///   this mutex. This closure is considered the critical section
+  ///   as it will only be executed once the calling thread has
+  ///   acquired the lock.
+  ///
+  /// - Returns: The return value, if any, of the `body` closure parameter.
   public borrowing func withLockUnchecked<U: ~Copyable, E>(
-  	_: (inout Value) throws(E) -> U
+    _ body: (inout Value) throws(E) -> U
   ) throws(E) -> U
 }
 
 extension Mutex where Value == Void {
-  // TODO: Documentation
+  /// Acquires the lock.
+  ///
+  /// If the calling thread was unsuccessful in acquiring the lock,
+  /// it will block execution until it can be acquired.
+  ///
+  /// - Warning: Recursive calls to 'lock()' by the acquired thread
+  ///   has behavior that is platform dependent. Some platforms may
+  ///   choose to panic the process, deadlock, or leave this behavior
+  ///   unspecified.
   @available(*, noasync)
   public borrowing func lock()
   
-  // TODO: Documentation
+  /// Attempts to acquire the lock.
+  ///
+  /// If the calling thread acquired the lock, this will return true.
+  /// Otherwise, the caller was unsuccessful in acquiring the lock and
+  /// will return false.
+  ///
+  /// - Warning: You must not attempt to call this method in a loop to gain
+  /// 	ownership of the lock. It is better to directly call 'lock()'
+  ///   instead.
+  ///
+  /// - Returns: A boolean indicating whether the calling thread
+  ///   successfully acquired the lock or not.
+  @availabile(*, noasync)
+  public borrowing func tryLock() -> Bool
+  
+  /// Releases the lock.
+  ///
+  /// The calling thread must have acquired the lock in order to call
+  /// this method.
+  ///
+  /// - Warning: Attempts to call this on unacquired threads will
+  ///   have platform dependent behavior, such as paniking or unspecified
+  ///   behavior. Attempts to call this when the lock is not acquired at all
+  ///   will exhibit similar platform dependent behavior.
   @available(*, noasync)
   public borrowing func unlock()
 }
@@ -120,9 +271,21 @@ extension Mutex: Sendable where Value: Sendable {}
 
 ## Interaction with Existing Language Features
 
-Following the [SE-0410 Atomics proposal](https://github.com/apple/swift-evolution/blob/main/proposals/0410-atomics.md), `Mutex` will share the same limitations `Atomic` and `AtomicLazyReference` has; you will not be able to declare a value of type `Mutex` with a `var`. There are other limitations such as not being able to pass one via `inout`, but please refer to the [Atomics proposal](https://github.com/apple/swift-evolution/blob/main/proposals/0410-atomics.md) for a more in-depth discussion on what is allowed and not allowed. These restrictions are enabled for `Mutex` for pretty much all of the same reasons why it was resticted for `Atomic`. We do not want to introduce dynamic exclusivity checking when even accessing a value of `Mutex` as a class stored property for instance.
+`Mutex` will decorated with the `@_staticExclusiveOnly` attribute, meaning you will not be able to declare a variable of type `Mutex` as `var`. These are the same restrictions imposed on the recently accepted `Atomic` and `AtomicLazyReference` types. Please refer to the [Atomics proposal](https://github.com/apple/swift-evolution/blob/main/proposals/0410-atomics.md) for a more in-depth discussion on what is allowed and not allowed. These restrictions are enabled for `Mutex` for all of the same reasons why it was resticted for `Atomic`. We do not want to introduce dynamic exclusivity checking when accessing a value of `Mutex` as a class stored property for instance.
 
 ### Interactions with Swift Concurrency
+
+It is important that low level system developers have access to the primitive `lock()`, `tryLock()`, and `unlock()` operations. However, in the face of `async`/`await`, these primitives are very dangerous. The example below highlights incorrect usage of these operations in an `async` function:
+
+```swift
+func test() async {
+  mutex.lock()             // Called on Thread A
+  await downloadImage(...) // <--- Potential suspension point
+  mutex.unlock()           // May be called on Thread A, B, C, etc.
+}
+```
+
+The potential suspension point may cause the proceeding code to be called on a different thread than the one that initiated the `await` call. Because of this, these methods are all marked as `@available(*, noasync)` and are only allowed to be called when `Value == Void` to further nudge folks to use the safer `withLock` APIs. Calling `withLock` in an asynchronous function is \_okay\_ because the same thread that calls `lock()` will be the same one that calls `unlock()` because there will not be any suspension points between the calls.
 
 Similar to `Atomic`, `Mutex` will have a conditional conformance to `Sendable` when the underlying value itself is also `Sendable`. Consider the following example declaring a global mutex in some top level script:
 
@@ -143,7 +306,7 @@ func something() {
 }
 ```
 
-Our variable is treated as "immutable", but the underlying type is not sendable, thus this variable is implicitly main actor-isolated. Here, we're attempting to reference a main actor-isolated piece of data on a synchronous global function that is not isolated to any actor, thus the warning (which will become an error in Swift 6). However, this warning is actually appreciated here because while the lock does protect the state it's holding onto, it does not protect class references or any underlying pointers that the value may contain leading to unprotected shared mutable state. In the example, the global function `something` now has access to load/store values from this pointer, but there's nothing synchronizing access to the memory referenced by the pointer thus multiple threads could potentially race with each other trying to read/write data into this memory. The same applies to non-sendable class references, anybody can alter the class instance with a reference to it and the only thing the lock is protecting is the reference value itself which is meaningless once multiple threads can get a copy of the reference.
+Our variable is treated as immutable by the compiler, but the underlying type is not sendable thus this variable is implicitly main actor-isolated. We're attempting to reference a main actor-isolated piece of data in a synchronous global function that is not isolated to any actor (hence the warning). However, this warning is actually appreciated. While the lock does protect the state it's holding onto, it does not protect class references or any underlying memory being pointed to (by pointers). In the example, the global function `something` now has access to read/write values from this pointer, but there's nothing synchronizing access to the memory referenced by the pointer. Multiple threads could potentially race with each other trying to read/write data into this memory. The same applies to non-sendable class references, once threads have a hold of the reference, they can potentially race with each other trying to mutate the underlying instance.
 
 We can fix this warning though, if we isolate usages of `something()` to the main actor as well:
 
@@ -151,13 +314,13 @@ We can fix this warning though, if we isolate usages of `something()` to the mai
 @MainActor
 func something() {
   // No more warnings!
-	lockedPointer.withLock {
+  lockedPointer.withLock {
     ...
   }
 }
 ````
 
-Usages of this mutex no longer emit these sendability warnings, but if we alter the example just very slightly we see the next issue we need to solve:
+Usages of this mutex no longer emit these sendability warnings, but if we alter the example just slightly we see the next issue we need to solve:
 
 ```swift
 class NonSendableReference {
@@ -176,7 +339,7 @@ func something() {
 }
 ```
 
-If the `withLock` method was not labeled with `@Sendable` then this code would emit no warnings. All good right? The compiler hasn't complained to us! Unfortunately, this highlights one of the bigger issues I mentioned earlier in that `Mutex` does not protect class references or any underlying memory referenced by pointers. This is still a hole for shared mutable state. We've now given a non-sendable value complete access to the memory pointed to by our value and that class does not guarantee synchronization for the data being modified at the pointer. We need to mark the closure in the `withLock` as `@Sendable` :
+If the `withLock` method was not labeled with `@Sendable` then this code would emit no warnings. All good right? The compiler hasn't complained to us! Unfortunately, this highlights one of the bigger issues I mentioned earlier in that `Mutex` does not protect class references or any underlying memory referenced by pointers. This is still a hole for shared mutable state. We've now given a non-sendable value complete access to the memory pointed to by our value. This non-sendable class does not guarantee synchronization for the data being modified at by the pointer. We need to mark the closure in the `withLock` as `@Sendable` :
 
 ```swift
 @MainActor
@@ -221,7 +384,7 @@ With [Region Based Isolation](https://github.com/apple/swift-evolution/blob/main
 
 ```swift
 public borrowing func withLock<U: ~Copyable & Sendable>(
-	_: (transferring inout Value) throws -> U
+  _: (transferring inout Value) throws -> U
 ) rethrows -> U
 ```
 
@@ -263,7 +426,7 @@ func add(_ i: Int, to mutex: Mutex<Int>) {
 }
 ```
 
-The above example shows an API similar to Rust's `MutexGuard` which allows access to the protected state in the mutex. C++'s guard on the other hand just performs `lock()` and `unlock()` for the user (because `std::mutex` doesn't protect any state). Of course the immediate issue with this approach right now is that we don't have access to non-escapable types so when one were to call `lock()`, there's nothing preventing the user from taking the guard value and escaping it from the scope that the caller is in. Rust resolves this issue with lifetimes, but C++ doesn't solve this at all and just declares:
+The above example shows an API similar to Rust's `MutexGuard` which allows access to the protected state in the mutex. C++'s guard on the other hand just performs `lock()` and `unlock()` for the user (because `std::mutex` doesn't protect any state). Of course the immediate issue with this approach right now is that we don't have access to non-escapable types. When one were to call `lock()`, there's nothing preventing the user from taking the guard value and escaping it from the scope that the caller is in. Rust resolves this issue with lifetimes, but C++ doesn't solve this at all and just declares:
 
 > The behavior is undefined if m is destroyed before the `lock_guard` object is.
 
@@ -280,11 +443,11 @@ func something(with mutex: Mutex<()>) {
   
   let b: Mutex<()>.Guard = mutex.lock()
   
-	...
+  ...
 }
 ```
 
-But again, this issue only occurs with `Void` and we forsee this particular specialization being somewhat rare because attaching state to a mutex is a much more common paradigm that fits into Swift.
+But again, this issue only occurs with `Void` and we forsee this particular specialization being somewhat rare because attaching state to a mutex is a much more common paradigm that fits into Swift. However, if we had this feature today, the primitive `lock()`/`unlock()` operations would be better suited in the form of the guard API. I don't believe we'd have those methods if we had guards.
 
 ### Reader-Writer Locks, Recursive Locks, etc.
 
@@ -294,11 +457,11 @@ Another interesting future direction is the introduction of new kinds of locks t
 
 ### Rename to `Lock` or similar
 
-A very common name for this type in various codebases is simply `Lock`. This is a decent name because many people know immediately what the purpose of the type is, but the issue is that it doesn't describe _how_ it's implemented. I believe this is a very important aspect of not only this specific type, but of synchronization primitives in general. Understanding that this particular lock is implemented via mutual exclusion conveys to developers who have used something similar in other languages that they cannot have multiple readers and cannot call `lock()` again on the acquired thread for instance. Many languages similar to Swift have opted into a similar design, naming this type mutex instead of a vague lock. In C++ we have `std::mutex`, and in Rust we have `Mutex`.
+A very common name for this type in various codebases is simply `Lock`. This is a decent name because many people know immediately what the purpose of the type is, but the issue is that it doesn't describe _how_ it's implemented. I believe this is a very important aspect of not only this specific type, but of synchronization primitives in general. Understanding that this particular lock is implemented via mutual exclusion conveys to developers who have used something similar in other languages that they cannot have multiple readers and cannot call `lock()` again on the acquired thread for instance. Many languages similar to Swift have opted into a similar design, naming this type mutex instead of a vague lock. In C++ we have `std::mutex` and in Rust we have `Mutex`.
 
 ### Include `Mutex` in the default Swift namespace (either in `Swift` or in `_Concurrency`)
 
-This is another intriguing idea because on one hand misusing this type is significantly harder than misusing something like `Atomic`. Generally speaking, we do want folks to reach for this when they just need a simple traditional lock. However, by including it in the default namespace we also unintentionally discourage folks from reaching for the language features and APIs they we've already built like `async/await`, `actors`, and so much more in this space. In the presence of our concurrency model, these traditional locks generally shouldn't be used except niche scenarios.
+This is another intriguing idea because on one hand misusing this type is significantly harder than misusing something like `Atomic`. Generally speaking, we do want folks to reach for this when they just need a simple traditional lock. However, by including it in the default namespace we also unintentionally discouraging folks from reaching for the language features and APIs they we've already built like `async/await`, `actors`, and so much more in this space. Gating the presence of this type behind `import Synchronization` is also an important marker for anyone reading code that the file deals with managing their own synchronization through the use of synchronization primitives such as `Atomic` and `Mutex`.
 
 ### Introduce a separate `UnsafeMutex` or similar
 
@@ -307,7 +470,7 @@ The purpose of this alternative is to absolutely disallow uses of the primitive 
 Consider the following:
 
 ```swift
-let mutex = Mutex<()>()
+let mutex = Mutex<()>(())
 
 func something() async {
   mutex.lock() // error: this function is marked 'noasync'
@@ -337,7 +500,7 @@ public struct UncheckedMutex<Value: ~Copyable>: ~Copyable {
   // but then we're repeating information that's already
   // in the type name 🤔
   public borrowing func withLock<U: ~Copyable, E>(
-  	_: (inout Value) throws(E) -> U
+    _: (inout Value) throws(E) -> U
   ) throws(E) -> U
   
   ...
