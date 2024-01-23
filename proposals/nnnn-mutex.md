@@ -294,10 +294,10 @@ let lockedPointer = Mutex<UnsafeMutablePointer<Int>>(...)
 
 func something() {
   // warning: non-sendable type 'Mutex<UnsafeMutablePointer<Int>>' in
-  // 					asynchronous access to main actor-isolated let 'lockedPointer'
-  //					cannot cross actor boundary
+  //          asynchronous access to main actor-isolated let 'lockedPointer'
+  //          cannot cross actor boundary
   // note: consider making generic struct 'Mutex' conform to the 'Sendable'
-  //			 protocol
+  //       protocol
   let pointer = lockedPointer.withLock {
     $0
   }
