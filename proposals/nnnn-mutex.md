@@ -365,9 +365,7 @@ By marking the closure as such, we've effectively declared that the mutex is in 
 
 ### When do I use `Mutex` vs. an Actor?
 
-`Mutex` is just another tool to ensure that access to mutable shared data is synchronized and well defined.
-
-Start with an `actor`.
+TODO
 
 ## Source compatibility
 
