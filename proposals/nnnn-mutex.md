@@ -284,7 +284,7 @@ func test() async {
 }
 ```
 
-The potential suspension point may cause the proceeding code to be called on a different thread than the one that initiated the `await` call. Because of this, these methods are all marked as `@available(*, noasync)` and are only allowed to be called when `Value == Void` to further nudge folks to use the safer `withLock` APIs. Calling `withLock` in an asynchronous function is \_okay\_ because the same thread that calls `lock()` will be the same one that calls `unlock()` because there will not be any suspension points between the calls.
+The potential suspension point may cause the proceeding code to be called on a different thread than the one that initiated the `await` call. Because of this, these methods are all marked as `@available(*, noasync)` and are only allowed to be called when `Value == Void` to further nudge folks to use the safer `withLock` APIs. Calling `withLock` in an synchronous function is \_okay\_ because the same thread that calls `lock()` will be the same one that calls `unlock()` because there can not be any suspension points between the calls.
 
 Similar to `Atomic`, `Mutex` will have a conditional conformance to `Sendable` when the underlying value itself is also `Sendable`. Consider the following example declaring a global mutex in some top level script:
 
