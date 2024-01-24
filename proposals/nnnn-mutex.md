@@ -26,11 +26,11 @@ Until now the only workable solution to implement locking in Swift has involved 
 
 ## Proposed solution
 
-We \_finally\_ propose a new type in the Standard Library Synchronization module: `Mutex`. This type will be a wrapper over a platform-specific mutex primitive, along with a user-defined state to protect. Below is an example use of `Mutex` protecting some internal data in a class usable simultaneously by many threads:
+We propose a new type in the Standard Library Synchronization module: `Mutex`. This type will be a wrapper over a platform-specific mutex primitive, along with a user-defined mutable state to protect. Below is an example use of `Mutex` protecting some internal data in a class usable simultaneously by many threads:
 
 ```swift
 class FancyManagerOfSorts {
-  let cache: Mutex<[String: Resource]>
+  let cache = Mutex<[String: Resource]>([:])
   
   func save(_ resource: Resouce, as key: String) {
     cache.withLock {
@@ -124,9 +124,9 @@ public struct Mutex<Value: ~Copyable>: ~Copyable {
   ///
   /// - Returns: The return value, if any, of the `body` closure parameter
   ///   or nil if the lock couldn't be acquired.
-  public borrowing func tryWithLock<U: ~Copyable & Sendable, E>(
-    _ body: @Sendable (inout Value) throws(E) -> U
-  ) throws(E) -> U?
+  public borrowing func tryWithLock<Result: ~Copyable & Sendable, E>(
+    _ body: @Sendable (inout Value) throws(E) -> Result
+  ) throws(E) -> Result?
   
   /// Attempts to acquire the lock and then calls the given closure if
   /// successful.
@@ -162,9 +162,9 @@ public struct Mutex<Value: ~Copyable>: ~Copyable {
   ///
   /// - Returns: The return value, if any, of the `body` closure parameter
   ///   or nil if the lock couldn't be acquired.
-  public borrowing func tryWithLockUnchecked<U: ~Copyable, E>(
-    _ body: @Sendable (inout Value) throws(E) -> U
-  ) throws(E) -> U?
+  public borrowing func tryWithLockUnchecked<Result: ~Copyable, E>(
+    _ body: @Sendable (inout Value) throws(E) -> Result
+  ) throws(E) -> Result?
   
   /// Calls the given closure after acquring the lock and then releases
   /// ownership.
@@ -189,9 +189,9 @@ public struct Mutex<Value: ~Copyable>: ~Copyable {
   ///   acquired the lock.
   ///
   /// - Returns: The return value, if any, of the `body` closure parameter.
-  public borrowing func withLock<U: ~Copyable & Sendable, E>(
-    _ body: @Sendable (inout Value) throws(E) -> U
-  ) throws(E) -> U
+  public borrowing func withLock<Result: ~Copyable & Sendable, E>(
+    _ body: @Sendable (inout Value) throws(E) -> Result
+  ) throws(E) -> Result
   
   /// Calls the given closure after acquring the lock and then releases
   /// ownership.
@@ -363,6 +363,12 @@ func something() {
 
 By marking the closure as such, we've effectively declared that the mutex is in itself its own isolation domain. We must not let non-sendable values it holds onto be unsafely sent across isolation domains to prevent these holes of shared mutable state.
 
+### When do I use `Mutex` vs. an Actor?
+
+`Mutex` is just another tool to ensure that access to mutable shared data is synchronized and well defined.
+
+Start with an `actor`.
+
 ## Source compatibility
 
 Source compatibility is preserved with the proposed API design as it is all additive as well as being hidden behind an explicit `import Synchronization`. Users who have not already imported the Synchronization module will not see this type, so there's no possibility of potential name conflicts with existing `Mutex` named types for instance. Of course, the standard library already has the rule that any type names that collide will disfavor the standard library's variant in favor of the user's defined type anyway.
@@ -409,7 +415,7 @@ extension Mutex {
 }
 
 extension Mutex {
-  public borrowing func lock() -> Guard {...}
+  public borrowing func lock() -> borrow(self) Guard {...}
 }
 
 func add(_ i: Int, to mutex: Mutex<Int>) {
