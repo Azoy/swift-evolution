@@ -224,47 +224,6 @@ public struct Mutex<Value: ~Copyable>: ~Copyable {
   ) throws(E) -> U
 }
 
-extension Mutex where Value == Void {
-  /// Acquires the lock.
-  ///
-  /// If the calling thread was unsuccessful in acquiring the lock,
-  /// it will block execution until it can be acquired.
-  ///
-  /// - Warning: Recursive calls to 'lock()' by the acquired thread
-  ///   has behavior that is platform dependent. Some platforms may
-  ///   choose to panic the process, deadlock, or leave this behavior
-  ///   unspecified.
-  @available(*, noasync)
-  public borrowing func lock()
-  
-  /// Attempts to acquire the lock.
-  ///
-  /// If the calling thread acquired the lock, this will return true.
-  /// Otherwise, the caller was unsuccessful in acquiring the lock and
-  /// will return false.
-  ///
-  /// - Warning: You must not attempt to call this method in a loop to gain
-  /// 	ownership of the lock. It is better to directly call 'lock()'
-  ///   instead.
-  ///
-  /// - Returns: A boolean indicating whether the calling thread
-  ///   successfully acquired the lock or not.
-  @availabile(*, noasync)
-  public borrowing func tryLock() -> Bool
-  
-  /// Releases the lock.
-  ///
-  /// The calling thread must have acquired the lock in order to call
-  /// this method.
-  ///
-  /// - Warning: Attempts to call this on unacquired threads will
-  ///   have platform dependent behavior, such as paniking or unspecified
-  ///   behavior. Attempts to call this when the lock is not acquired at all
-  ///   will exhibit similar platform dependent behavior.
-  @available(*, noasync)
-  public borrowing func unlock()
-}
-
 extension Mutex: Sendable where Value: Sendable {}
 ```
 
@@ -273,18 +232,6 @@ extension Mutex: Sendable where Value: Sendable {}
 `Mutex` will decorated with the `@_staticExclusiveOnly` attribute, meaning you will not be able to declare a variable of type `Mutex` as `var`. These are the same restrictions imposed on the recently accepted `Atomic` and `AtomicLazyReference` types. Please refer to the [Atomics proposal](https://github.com/apple/swift-evolution/blob/main/proposals/0410-atomics.md) for a more in-depth discussion on what is allowed and not allowed. These restrictions are enabled for `Mutex` for all of the same reasons why it was resticted for `Atomic`. We do not want to introduce dynamic exclusivity checking when accessing a value of `Mutex` as a class stored property for instance.
 
 ### Interactions with Swift Concurrency
-
-It is important that low level system developers have access to the primitive `lock()`, `tryLock()`, and `unlock()` operations. However, in the face of `async`/`await`, these primitives are very dangerous. The example below highlights incorrect usage of these operations in an `async` function:
-
-```swift
-func test() async {
-  mutex.lock()             // Called on Thread A
-  await downloadImage(...) // <--- Potential suspension point
-  mutex.unlock()           // May be called on Thread A, B, C, etc.
-}
-```
-
-The potential suspension point may cause the proceeding code to be called on a different thread than the one that initiated the `await` call. Because of this, these methods are all marked as `@available(*, noasync)` and are only allowed to be called when `Value == Void` to further nudge folks to use the safer `withLock` APIs. Calling `withLock` in an asynchronous function is \_okay\_ because the same thread that calls `lock()` will be the same one that calls `unlock()` because there will not be any suspension points between the calls.
 
 Similar to `Atomic`, `Mutex` will have a conditional conformance to `Sendable` when the underlying value itself is also `Sendable`. Consider the following example declaring a global mutex in some top level script:
 
@@ -457,6 +404,22 @@ But again, this issue only occurs with `Void` and we forsee this particular spec
 Another interesting future direction is the introduction of new kinds of locks to be added to the standard library, such as a reader-writer lock. One of the core issues with the proposal mutual exclusion lock is that anyone who takes the lock, either a reader and/or writer, must be the only person with exclusive access to the protected state. This is somewhat unfortunate for models where there are infinitely more readers than there will be writers to the state. A reader-writer lock resolves this issue by allowing multiple readers to take the lock and enforces that writers who need to mutate the state have exclusive access to the value. Another potential lock is a recursive lock who allows the lock to be acquired multiple times by the acquired thread. In the same vein, the acquired thread needs to be the one to release the lock and needs to release X amount of times equal to the number of times it acquired it.
 
 ## Alternatives considered
+
+### Implement `lock()`, `unlock()`, and `tryLock()`
+
+Seemingly missing from the `Mutex` type are the primitive locking and unlocking functions. These functions are fraught with peril in both Swift's concurrency model and in its ownership model.
+
+In the face of `async`/`await`, these primitives are very dangerous. The example below highlights incorrect usage of these operations in an `async` function:
+
+```swift
+func test() async {
+  mutex.lock()             // Called on Thread A
+  await downloadImage(...) // <--- Potential suspension point
+  mutex.unlock()           // May be called on Thread A, B, C, etc.
+}
+```
+
+The potential suspension point may cause the proceeding code to be called on a different thread than the one that initiated the `await` call. We can make these primitives safe in asynchronous contexts though by disallowing their use altogether by marking them `@available(*, noasync)`. Calling `withLock` in an asynchronous function is \_okay\_ because the same thread that calls `lock()` will be the same one that calls `unlock()` because there will not be any suspension points between the calls.
 
 ### Rename to `Lock` or similar
 
